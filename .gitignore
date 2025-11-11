@@ -20,4 +20,4 @@
 /coverage
 
 # Rust build artifacts
-/tools/create2-vanity-rs/target
+/target
