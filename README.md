@@ -1,6 +1,6 @@
 # EVM Smart Contract Vanity Address Generator
 
-This Rust helper brute-forces CREATE2 salts so you can land contracts (via `Create2Factory` or the universal CREATE2 deployer) at vanity addresses. It consumes Hardhat artifacts (or any JSON artifact with `bytecode`), so you can point it at any compiled contract without rewriting init code by hand.
+This Rust helper brute-forces CREATE2 salts so you can land contracts (via `Create2Factory` or the universal CREATE2 deployer) at vanity addresses. It consumes Hardhat artifacts (or any JSON artifact with `bytecode`) and can also take a raw bytecode hex blob, so you can point it at any compiled contract without rewriting init code by hand.
 
 ## Features
 
@@ -32,6 +32,8 @@ Key flags (mirrors `--help`):
 
 - `--factory <addr>` – deployed `Create2Factory` address (20-byte hex).
 - `--artifact <path>` – Hardhat artifact JSON (default: `artifacts/contracts/SimpleStorage.sol/SimpleStorage.json`).
+- `--bytecode <hex>` – override the artifact and hash this raw init code (useful when you already appended constructor args).
+- `--constructor-args <csv>` – supply comma-separated constructor arguments (parsed using the artifact ABI and encoded automatically).
 - `--salt <hex>` – deterministic mode; prints the resulting address and exits.
 - `--prefix` / `--suffix` – lowercase hex constraints unless checksum mode is enabled.
 - `--checksum-match` – apply prefix/suffix to the EIP-55 checksum form (case-sensitive). Slower but prettier.
@@ -39,6 +41,8 @@ Key flags (mirrors `--help`):
 - `--threads <n>` – override Rayon worker count.
 
 If neither `--prefix` nor `--suffix` is provided you must pass `--salt`.
+
+Constructor encoding: the tool reads the artifact ABI and, if you pass `--constructor-args`, ABI-encodes those values (comma-separated) before hashing the init code. Example for a single `address` parameter: `--constructor-args 0x1234...dead`. The arguments must appear in the same order as the constructor inputs.
 
 ## Performance tips
 
@@ -73,6 +77,7 @@ Many networks ship the singleton CREATE2 deployer at `0x4e59b44847B379578588920c
 npm exec tsx scripts/build-create2-calldata.ts \
   --salt 0xYourSaltFoundByVanityTool \
   --artifact artifacts/contracts/SimpleStorage.sol/SimpleStorage.json \
+  --constructor-args 0xOwnerAddress \
   --out calldata.txt
 ```
 
@@ -86,3 +91,12 @@ cast send 0x4e59b44847B379578588920cA78FbF26c0B4956C \
 ```
 
 The singleton will CREATE2-deploy the provided init code using the exact salt you searched for, yielding the deterministic vanity address. Once your own `Create2Factory` is live you can call its ABI directly, but the universal deployer is perfect for bootstrapping the very first factory or any one-off vanity contract.
+
+### Keep constructor args in sync
+
+- Pass identical arguments to both the vanity search (`create2-vanity --constructor-args …`) and the calldata builder (`scripts/build-create2-calldata.ts --constructor-args …`) so the init-code hash stays consistent.
+- When verifying on explorers (Hardhat example):  
+  ```bash
+  npm exec hardhat verify -- --network <net> <deployed-address> "0xOwnerAddress"
+  ```  
+  Replace the address string with the same constructor value you encoded above (or wrap multiple args in a JSON array).

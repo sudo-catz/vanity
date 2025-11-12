@@ -1,5 +1,6 @@
 use std::{
     fs,
+    io::Cursor,
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -15,6 +16,8 @@ use rand::{rngs::StdRng, Rng, SeedableRng};
 use rayon::ThreadPoolBuilder;
 use serde::Deserialize;
 use tiny_keccak::{Hasher, Keccak};
+use ethabi::token::{LenientTokenizer, Tokenizer};
+use ethabi::Contract;
 
 #[derive(Parser, Debug)]
 #[command(name = "create2-vanity")]
@@ -27,6 +30,14 @@ struct Args {
     /// Path to Hardhat artifact JSON (must include `bytecode`)
     #[arg(long, default_value = "artifacts/contracts/SimpleStorage.sol/SimpleStorage.json")]
     artifact: PathBuf,
+
+    /// Optional raw bytecode to use instead of reading from the artifact
+    #[arg(long)]
+    bytecode: Option<String>,
+
+    /// Optional comma-separated constructor arguments (parsed against the artifact ABI)
+    #[arg(long = "constructor-args", value_delimiter = ',', num_args = 0..)]
+    constructor_args: Option<Vec<String>>,
 
     /// Optional explicit salt. Prints the resulting address and exits.
     #[arg(long)]
@@ -56,16 +67,36 @@ struct Args {
 #[derive(Deserialize)]
 struct Artifact {
     bytecode: String,
+    abi: serde_json::Value,
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
 
     let factory = parse_address(&args.factory)?;
-    let artifact = load_artifact(&args.artifact)?;
-    let bytecode = parse_hex_bytes(&artifact.bytecode)?.into_boxed_slice();
+    let need_artifact = args.bytecode.is_none() || args.constructor_args.is_some();
+    let artifact = if need_artifact {
+        Some(load_artifact(&args.artifact)?)
+    } else {
+        None
+    };
+    let mut bytecode_hex = if let Some(custom) = &args.bytecode {
+        custom.clone()
+    } else {
+        artifact
+            .as_ref()
+            .map(|a| a.bytecode.clone())
+            .expect("artifact must be loaded when --bytecode is not provided")
+    };
+    if let Some(constructor_args) = &args.constructor_args {
+        let artifact = artifact
+            .as_ref()
+            .ok_or_else(|| anyhow!("--constructor-args requires an artifact with ABI"))?;
+        bytecode_hex = encode_constructor(bytecode_hex, artifact, constructor_args)?;
+    }
+    let bytecode = parse_hex_bytes(&bytecode_hex)?.into_boxed_slice();
     if bytecode.is_empty() {
-        return Err(anyhow!("Artifact bytecode is empty"));
+        return Err(anyhow!("Bytecode payload is empty"));
     }
 
     let init_hash = keccak(&bytecode);
@@ -110,7 +141,11 @@ fn main() -> Result<()> {
 
     println!("Searching for vanity salt...");
     println!("Factory   : {}", format_hex(&factory));
-    println!("Artifact  : {}", args.artifact.display());
+    if args.bytecode.is_some() && args.constructor_args.is_none() {
+        println!("Bytecode  : provided via --bytecode");
+    } else {
+        println!("Artifact  : {}", args.artifact.display());
+    }
     println!("Init hash : {}", format_hex(&init_hash));
     if let Some(p) = &prefix {
         println!("Prefix    : {}", p);
@@ -326,4 +361,36 @@ fn checksum_hex(address: &[u8; 20]) -> String {
         }
     }
     result
+}
+
+fn encode_constructor(
+    bytecode_hex: String,
+    artifact: &Artifact,
+    args: &[String],
+) -> Result<String> {
+    let abi_bytes = serde_json::to_vec(&artifact.abi)?;
+    let mut cursor = Cursor::new(abi_bytes);
+    let contract = Contract::load(&mut cursor)
+        .context("Failed to parse ABI from artifact")?;
+    let constructor = contract
+        .constructor()
+        .ok_or_else(|| anyhow!("Artifact ABI does not define a constructor"))?;
+    if constructor.inputs.len() != args.len() {
+        return Err(anyhow!(
+            "Constructor expects {} arguments but {} provided",
+            constructor.inputs.len(),
+            args.len()
+        ));
+    }
+    let mut tokens = Vec::with_capacity(args.len());
+    for (param, value) in constructor.inputs.iter().zip(args.iter()) {
+        let token = LenientTokenizer::tokenize(&param.kind, value)
+            .with_context(|| format!("Failed to parse constructor arg '{}' for type {:?}", value, param.kind))?;
+        tokens.push(token);
+    }
+    let bytecode = parse_hex_bytes(&bytecode_hex)?;
+    let encoded = constructor
+        .encode_input(bytecode.clone(), &tokens)
+        .context("Failed to encode constructor arguments")?;
+    Ok(format_hex(&encoded))
 }
