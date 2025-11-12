@@ -1,23 +1,22 @@
+use anyhow::{anyhow, Context, Result};
+use clap::Parser;
+use ethabi::token::{LenientTokenizer, Tokenizer};
+use ethabi::Contract;
+use hex::FromHex;
+use rand::Rng;
+use rayon::ThreadPoolBuilder;
+use serde::{Deserialize, Serialize};
 use std::{
     fs,
     io::Cursor,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
     },
     time::Instant,
 };
-
-use anyhow::{anyhow, Context, Result};
-use clap::Parser;
-use hex::FromHex;
-use rand::{rngs::StdRng, Rng, SeedableRng};
-use rayon::ThreadPoolBuilder;
-use serde::Deserialize;
 use tiny_keccak::{Hasher, Keccak};
-use ethabi::token::{LenientTokenizer, Tokenizer};
-use ethabi::Contract;
 
 #[derive(Parser, Debug)]
 #[command(name = "create2-vanity")]
@@ -28,7 +27,10 @@ struct Args {
     factory: String,
 
     /// Path to Hardhat artifact JSON (must include `bytecode`)
-    #[arg(long, default_value = "artifacts/contracts/SimpleStorage.sol/SimpleStorage.json")]
+    #[arg(
+        long,
+        default_value = "artifacts/contracts/SimpleStorage.sol/SimpleStorage.json"
+    )]
     artifact: PathBuf,
 
     /// Optional raw bytecode to use instead of reading from the artifact
@@ -62,12 +64,101 @@ struct Args {
     /// Number of worker threads (defaults to CPU cores)
     #[arg(long)]
     threads: Option<usize>,
+
+    /// Optional deterministic RNG seed (u64). Enables reproducible or sharded searches.
+    #[arg(long)]
+    seed: Option<u64>,
+
+    /// Path to write periodic checkpoint JSON (stores the next attempt + config hash).
+    #[arg(long)]
+    checkpoint: Option<PathBuf>,
+
+    /// Resume search from an existing checkpoint file.
+    #[arg(long)]
+    resume: Option<PathBuf>,
+
+    /// Attempts between checkpoint flushes (only used with --checkpoint).
+    #[arg(long, default_value_t = 100_000)]
+    checkpoint_interval: u64,
 }
 
 #[derive(Deserialize)]
 struct Artifact {
     bytecode: String,
     abi: serde_json::Value,
+}
+
+#[derive(Serialize, Deserialize)]
+struct CheckpointFile {
+    version: u32,
+    next_attempt: u64,
+    base_seed: u64,
+    config_hash: String,
+}
+
+const ATTEMPT_BATCH: u64 = 2048;
+const PROGRESS_INTERVAL: u64 = 10_000;
+
+struct CheckpointWriter {
+    path: PathBuf,
+    config_hash: String,
+    base_seed: u64,
+    interval: u64,
+    next_flush: AtomicU64,
+    lock: Mutex<()>,
+}
+
+impl CheckpointWriter {
+    fn new(path: PathBuf, config_hash: String, base_seed: u64, interval: u64) -> Self {
+        Self {
+            path,
+            config_hash,
+            base_seed,
+            interval: interval.max(1),
+            next_flush: AtomicU64::new(0),
+            lock: Mutex::new(()),
+        }
+    }
+
+    fn maybe_write(&self, attempts: u64) {
+        let target = self.next_flush.load(Ordering::Relaxed);
+        if attempts < target {
+            return;
+        }
+        if let Ok(_guard) = self.lock.try_lock() {
+            let target = self.next_flush.load(Ordering::Relaxed);
+            if attempts < target {
+                return;
+            }
+            if let Err(err) = self.write_file(attempts) {
+                eprintln!(
+                    "Failed to write checkpoint {}: {err:?}",
+                    self.path.display()
+                );
+            } else {
+                let next = attempts.saturating_add(self.interval);
+                self.next_flush.store(next, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn force_write(&self, attempts: u64) -> Result<()> {
+        let _guard = self.lock.lock().expect("checkpoint mutex poisoned");
+        self.write_file(attempts)?;
+        let next = attempts.saturating_add(self.interval);
+        self.next_flush.store(next, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn write_file(&self, attempts: u64) -> Result<()> {
+        let payload = CheckpointFile {
+            version: 1,
+            next_attempt: attempts,
+            base_seed: self.base_seed,
+            config_hash: self.config_hash.clone(),
+        };
+        save_checkpoint_file(&self.path, &payload)
+    }
 }
 
 fn main() -> Result<()> {
@@ -139,6 +230,54 @@ fn main() -> Result<()> {
         .max(1);
     let checksum_mode = args.checksum_match;
 
+    let mut base_seed = args.seed.unwrap_or_else(|| rand::thread_rng().gen());
+    let mut resume_attempt = 0u64;
+    let resume_checkpoint = if let Some(path) = args.resume.as_ref() {
+        Some((
+            path.clone(),
+            load_checkpoint_file(path)
+                .with_context(|| format!("Failed to load checkpoint at {}", path.display()))?,
+        ))
+    } else {
+        None
+    };
+
+    if let Some((_, checkpoint)) = &resume_checkpoint {
+        if let Some(seed) = args.seed {
+            if seed != checkpoint.base_seed {
+                return Err(anyhow!(
+                    "Checkpoint base seed ({}) does not match --seed ({})",
+                    checkpoint.base_seed,
+                    seed
+                ));
+            }
+        }
+        base_seed = checkpoint.base_seed;
+        resume_attempt = checkpoint.next_attempt;
+    }
+
+    let config_hash = hex::encode(config_fingerprint(
+        base_seed,
+        &factory,
+        &init_hash,
+        &prefix,
+        &suffix,
+        checksum_mode,
+    ));
+
+    if let Some((_, checkpoint)) = &resume_checkpoint {
+        if checkpoint.config_hash != config_hash {
+            return Err(anyhow!(
+                "Checkpoint was created for different search parameters."
+            ));
+        }
+    }
+
+    if resume_attempt >= max_attempts {
+        println!("Checkpoint already exhausted the requested attempt budget.");
+        return Ok(());
+    }
+
     println!("Searching for vanity salt...");
     println!("Factory   : {}", format_hex(&factory));
     if args.bytecode.is_some() && args.constructor_args.is_none() {
@@ -165,9 +304,44 @@ fn main() -> Result<()> {
     };
     println!("Max tries : {}", max_display);
     println!("Threads   : {}", threads);
+    match (&resume_checkpoint, args.seed) {
+        (Some(_), _) => println!("RNG seed  : {} (from checkpoint)", base_seed),
+        (None, Some(seed)) => println!("RNG seed  : {} (user supplied)", seed),
+        (None, None) => println!("RNG seed  : {} (randomized)", base_seed),
+    }
+    if resume_attempt > 0 {
+        println!("Start at  : attempt {}", resume_attempt);
+    }
+    if let Some((path, _)) = &resume_checkpoint {
+        println!("Resume    : {}", path.display());
+    }
+    if let Some(path) = &args.checkpoint {
+        println!(
+            "Checkpoint : {} (every {} attempts)",
+            path.display(),
+            args.checkpoint_interval.max(1)
+        );
+    }
+
+    let checkpoint_writer = if let Some(path) = args.checkpoint.clone() {
+        if args.checkpoint_interval == 0 {
+            return Err(anyhow!("--checkpoint-interval must be greater than 0"));
+        }
+        let writer = Arc::new(CheckpointWriter::new(
+            path,
+            config_hash.clone(),
+            base_seed,
+            args.checkpoint_interval,
+        ));
+        writer.force_write(resume_attempt)?;
+        Some(writer)
+    } else {
+        None
+    };
 
     let start = Instant::now();
-    let counter = Arc::new(AtomicU64::new(0));
+    let scheduler = Arc::new(AtomicU64::new(resume_attempt));
+    let attempts_done = Arc::new(AtomicU64::new(resume_attempt));
     let found = Arc::new(AtomicBool::new(false));
     let result = Arc::new(Mutex::new(None));
 
@@ -178,8 +352,9 @@ fn main() -> Result<()> {
 
     pool.install(|| {
         rayon::scope(|s| {
-            for _ in 0..threads {
-                let counter = Arc::clone(&counter);
+            for worker_idx in 0..threads {
+                let scheduler = Arc::clone(&scheduler);
+                let attempts_done = Arc::clone(&attempts_done);
                 let found = Arc::clone(&found);
                 let result = Arc::clone(&result);
                 let factory = factory;
@@ -187,34 +362,68 @@ fn main() -> Result<()> {
                 let prefix = prefix.clone();
                 let suffix = suffix.clone();
                 let checksum_mode = checksum_mode;
+                let checkpoint = checkpoint_writer.clone();
 
                 s.spawn(move |_| {
-                    let mut rng = StdRng::from_entropy();
-                    loop {
+                    let mut data = build_data_template(&factory, &init_hash);
+                    let mut stop = false;
+
+                    while !stop {
                         if found.load(Ordering::Acquire) {
                             break;
                         }
 
-                        let attempt = counter.fetch_add(1, Ordering::Relaxed);
-                        if attempt >= max_attempts {
+                        let start = scheduler.fetch_add(ATTEMPT_BATCH, Ordering::Relaxed);
+                        if start >= max_attempts {
                             break;
                         }
 
-                        if attempt != 0 && attempt % 10_000 == 0 {
-                            println!("Checked {} salts...", attempt);
+                        let end = (start + ATTEMPT_BATCH).min(max_attempts);
+                        let mut processed = 0u64;
+                        let mut attempt = start;
+
+                        while attempt < end {
+                            if found.load(Ordering::Acquire) {
+                                stop = true;
+                                break;
+                            }
+
+                            if worker_idx == 0 && attempt != 0 && attempt % PROGRESS_INTERVAL == 0 {
+                                println!("Checked {} salts...", attempt);
+                            }
+
+                            let attempt_number = attempt;
+                            attempt += 1;
+                            processed += 1;
+
+                            let salt = salt_from_attempt(base_seed, attempt_number);
+                            set_salt(&mut data, &salt);
+                            let address = compute_address_from_data(&data);
+
+                            if matches_pattern(
+                                &address,
+                                prefix.as_deref(),
+                                suffix.as_deref(),
+                                checksum_mode,
+                            ) {
+                                let mut guard = result.lock().expect("poisoned mutex");
+                                *guard = Some((salt, address, attempt_number + 1));
+                                found.store(true, Ordering::Release);
+                                stop = true;
+                                break;
+                            }
                         }
 
-                        let salt = random_salt(&mut rng);
-                        let address = compute_address(&factory, &salt, &init_hash);
-                        if matches_pattern(
-                            &address,
-                            prefix.as_deref(),
-                            suffix.as_deref(),
-                            checksum_mode,
-                        ) {
-                            let mut guard = result.lock().expect("poisoned mutex");
-                            *guard = Some((salt, address, attempt + 1));
-                            found.store(true, Ordering::Release);
+                        if processed == 0 {
+                            continue;
+                        }
+
+                        let total =
+                            attempts_done.fetch_add(processed, Ordering::Relaxed) + processed;
+                        if let Some(writer) = checkpoint.as_ref() {
+                            writer.maybe_write(total);
+                        }
+                        if stop {
                             break;
                         }
                     }
@@ -224,10 +433,13 @@ fn main() -> Result<()> {
     });
 
     let elapsed = start.elapsed();
-    let attempts_made = counter.load(Ordering::Relaxed).min(max_attempts);
+    let attempts_made = attempts_done.load(Ordering::Relaxed).min(max_attempts);
     if let Some((salt, address, attempts_needed)) = result.lock().unwrap().take() {
         println!();
-        println!("Found match after {} attempts ({:.2?})", attempts_needed, elapsed);
+        println!(
+            "Found match after {} attempts ({:.2?})",
+            attempts_needed, elapsed
+        );
         println!("Salt      : {}", format_hex(&salt));
         println!("Address   : {}", format_hex(&address));
         println!("Checksum  : {}", checksum_address(&address));
@@ -240,14 +452,18 @@ fn main() -> Result<()> {
         );
     }
 
+    if let Some(writer) = checkpoint_writer.as_ref() {
+        writer.force_write(attempts_made)?;
+    }
+
     Ok(())
 }
 
 fn load_artifact(path: &PathBuf) -> Result<Artifact> {
     let raw = fs::read_to_string(path)
         .with_context(|| format!("Failed to read artifact at {}", path.display()))?;
-    let artifact: Artifact =
-        serde_json::from_str(&raw).context("Failed to parse artifact JSON (missing `bytecode`?)")?;
+    let artifact: Artifact = serde_json::from_str(&raw)
+        .context("Failed to parse artifact JSON (missing `bytecode`?)")?;
     Ok(artifact)
 }
 
@@ -280,13 +496,25 @@ fn parse_salt(value: &str) -> Result<[u8; 32]> {
 }
 
 fn compute_address(factory: &[u8; 20], salt: &[u8; 32], init_hash: &[u8; 32]) -> [u8; 20] {
+    let mut data = build_data_template(factory, init_hash);
+    set_salt(&mut data, salt);
+    compute_address_from_data(&data)
+}
+
+fn build_data_template(factory: &[u8; 20], init_hash: &[u8; 32]) -> [u8; 85] {
     let mut data = [0u8; 1 + 20 + 32 + 32];
     data[0] = 0xff;
     data[1..21].copy_from_slice(factory);
-    data[21..53].copy_from_slice(salt);
     data[53..85].copy_from_slice(init_hash);
+    data
+}
 
-    let hash = keccak(&data);
+fn set_salt(buffer: &mut [u8; 85], salt: &[u8; 32]) {
+    buffer[21..53].copy_from_slice(salt);
+}
+
+fn compute_address_from_data(data: &[u8; 85]) -> [u8; 20] {
+    let hash = keccak(data);
 
     let mut address = [0u8; 20];
     address.copy_from_slice(&hash[12..32]);
@@ -329,8 +557,56 @@ fn format_hex(bytes: &[u8]) -> String {
     format!("0x{}", hex::encode(bytes))
 }
 
-fn random_salt(rng: &mut StdRng) -> [u8; 32] {
-    rng.gen::<[u8; 32]>()
+fn salt_from_attempt(base_seed: u64, attempt: u64) -> [u8; 32] {
+    let mut input = [0u8; 16];
+    input[..8].copy_from_slice(&base_seed.to_le_bytes());
+    input[8..].copy_from_slice(&attempt.to_le_bytes());
+    keccak(&input)
+}
+
+fn config_fingerprint(
+    base_seed: u64,
+    factory: &[u8; 20],
+    init_hash: &[u8; 32],
+    prefix: &Option<String>,
+    suffix: &Option<String>,
+    checksum_mode: bool,
+) -> [u8; 32] {
+    let mut data = Vec::new();
+    data.extend_from_slice(factory);
+    data.extend_from_slice(init_hash);
+    data.extend_from_slice(&base_seed.to_le_bytes());
+    data.push(if checksum_mode { 1 } else { 0 });
+    if let Some(p) = prefix {
+        data.extend_from_slice(p.as_bytes());
+        data.push(0xff);
+    }
+    if let Some(s) = suffix {
+        data.extend_from_slice(s.as_bytes());
+        data.push(0x01);
+    }
+    keccak(&data)
+}
+
+fn load_checkpoint_file(path: &Path) -> Result<CheckpointFile> {
+    let raw = fs::read_to_string(path)
+        .with_context(|| format!("Unable to read checkpoint {}", path.display()))?;
+    let checkpoint: CheckpointFile = serde_json::from_str(&raw)
+        .with_context(|| format!("Invalid checkpoint JSON {}", path.display()))?;
+    if checkpoint.version != 1 {
+        return Err(anyhow!(
+            "Unsupported checkpoint version {}",
+            checkpoint.version
+        ));
+    }
+    Ok(checkpoint)
+}
+
+fn save_checkpoint_file(path: &Path, payload: &CheckpointFile) -> Result<()> {
+    let data = serde_json::to_vec_pretty(payload)?;
+    fs::write(path, data)
+        .with_context(|| format!("Failed to write checkpoint {}", path.display()))?;
+    Ok(())
 }
 
 fn checksum_address(address: &[u8; 20]) -> String {
@@ -370,8 +646,7 @@ fn encode_constructor(
 ) -> Result<String> {
     let abi_bytes = serde_json::to_vec(&artifact.abi)?;
     let mut cursor = Cursor::new(abi_bytes);
-    let contract = Contract::load(&mut cursor)
-        .context("Failed to parse ABI from artifact")?;
+    let contract = Contract::load(&mut cursor).context("Failed to parse ABI from artifact")?;
     let constructor = contract
         .constructor()
         .ok_or_else(|| anyhow!("Artifact ABI does not define a constructor"))?;
@@ -384,8 +659,12 @@ fn encode_constructor(
     }
     let mut tokens = Vec::with_capacity(args.len());
     for (param, value) in constructor.inputs.iter().zip(args.iter()) {
-        let token = LenientTokenizer::tokenize(&param.kind, value)
-            .with_context(|| format!("Failed to parse constructor arg '{}' for type {:?}", value, param.kind))?;
+        let token = LenientTokenizer::tokenize(&param.kind, value).with_context(|| {
+            format!(
+                "Failed to parse constructor arg '{}' for type {:?}",
+                value, param.kind
+            )
+        })?;
         tokens.push(token);
     }
     let bytecode = parse_hex_bytes(&bytecode_hex)?;

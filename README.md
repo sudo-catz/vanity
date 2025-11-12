@@ -39,6 +39,10 @@ Key flags (mirrors `--help`):
 - `--checksum-match` – apply prefix/suffix to the EIP-55 checksum form (case-sensitive). Slower but prettier.
 - `--attempts <n>` – optional cap (0 = unlimited).
 - `--threads <n>` – override Rayon worker count.
+- `--seed <u64>` – deterministic RNG seed so you can resume a run or shard work across machines. Defaults to OS randomness.
+- `--checkpoint <path>` – periodically write a JSON checkpoint with the next attempt counter + config hash.
+- `--resume <path>` – restart from a previously saved checkpoint (enforces matching config + seed).
+- `--checkpoint-interval <n>` – attempts between checkpoint flushes (default: 100k).
 
 If neither `--prefix` nor `--suffix` is provided you must pass `--salt`.
 
@@ -47,8 +51,14 @@ Constructor encoding: the tool reads the artifact ABI and, if you pass `--constr
 ## Performance tips
 
 - Each constrained nibble multiplies difficulty by 16; checksum mode effectively doubles it per nibble. `bee…cafe` ≈ 1/16⁷, `cafe…babe` ≈ 1/16⁸, etc.
-- Progress logs print every 10k attempts per worker. Redirect stdout for very long sessions.
-- To split work across machines, run multiple instances with different RNG seeds (or swap in `SmallRng` with deterministic seeding).
+- Progress logs now emit every 10k attempts from worker 0 to minimize stdout contention. Redirect stdout for very long sessions.
+- Salts are derived deterministically from `(seed, attempt_index)`, so two runs only overlap if they intentionally share both values. Give each machine a unique `--seed` to split work safely.
+
+## Checkpoint & resume
+
+- Pass `--checkpoint checkpoint.json` to write the current attempt counter every `--checkpoint-interval` attempts (defaults to 100k). The file stores the base seed, config hash, and the next attempt to try.
+- Use `--resume checkpoint.json` (optionally along with `--checkpoint` to keep updating the same file) to continue exactly where you left off. The CLI verifies the hash of all search parameters plus the seed to prevent mismatched resumes.
+- Because salts depend only on `(seed, attempt)`, resuming does not re-check previously tested salts—execution jumps straight to the stored attempt ID.
 
 ## Example: predict a known salt
 
@@ -63,9 +73,9 @@ Output shows the deterministic CREATE2 child address plus its checksum so you ca
 
 ## Tweaking ideas
 
-- Swap `StdRng` for `SmallRng` or a counter-based generator per thread.
-- Precompute the packed `0xff || factory || salt || initHash` prefix so each iteration touches fewer bytes.
-- Funnel status logging through a single channel/thread to avoid `println!` contention on huge runs.
+- Add a lightweight coordinator/worker protocol so you can dole out seed windows automatically across a fleet.
+- Experiment with SIMD/GPU Keccak implementations once CPU-side overhead is squeezed out.
+- Surface live stats (attempts/s, ETA per nibble, etc.) through a structured logging or metrics endpoint for richer monitoring.
 
 PRs welcome if you add distributed search, checkpointing, or alternate front-ends!
 
