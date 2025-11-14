@@ -4,7 +4,7 @@ These binaries live in this workspace:
 
 - **`create2-vanity`** – brute-forces CREATE2 salts so contracts deployed via `Create2Factory` (or the universal CREATE2 deployer) can land at vanity addresses. It reads Hardhat artifacts, ABI-encodes constructor args for you, and mirrors the exact hashing that a chain performs before CREATE2 deployments.
 - **`vanity_eoa`** – brute-forces externally-owned account (EOA) private keys whose addresses match a desired prefix/suffix. It reuses the same deterministic scheduling, checkpoint/resume flow, and exposes progress stats that dashboards can scrape.
-- **`vanity_solana`** – brute-forces Solana keypairs (Base58 addresses) with the same deterministic `(seed, attempt)` schedule plus optional BIP-39 output and HD derivation paths.
+- **`vanity_solana`** – brute-forces Solana ed25519 keypairs (Base58 addresses) using the same deterministic `(seed, attempt)` schedule plus optional BIP-39 output and configurable HD derivation paths.
 - **`vanity_bitcoin`** – brute-forces Bitcoin addresses (Base58 P2PKH `1…`, Bech32 v0 `bc1q…`, or Bech32 v1 `bc1p…`) plus compressed WIFs, optional BIP-39 output, and checkpoints.
 
 All binaries are CPU-bound Rust executables built on Rayon for multi-threading and TinyKeccak for hashing.
