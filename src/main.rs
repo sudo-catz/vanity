@@ -197,7 +197,7 @@ fn main() -> Result<()> {
     let output_path = args
         .output
         .clone()
-        .unwrap_or_else(|| PathBuf::from("salt.json"));
+        .unwrap_or_else(|| PathBuf::from("results/salt.json"));
 
     let factory = parse_address(&args.factory)?;
     let need_artifact = args.bytecode.is_none() || args.constructor_args.is_some();
@@ -667,6 +667,10 @@ fn load_checkpoint_file(path: &Path) -> Result<CheckpointFile> {
 }
 
 fn save_checkpoint_file(path: &Path, payload: &CheckpointFile) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create checkpoint dir {}", parent.display()))?;
+    }
     let data = serde_json::to_vec_pretty(payload)?;
     fs::write(path, data)
         .with_context(|| format!("Failed to write checkpoint {}", path.display()))?;
@@ -694,6 +698,10 @@ fn append_result_file(path: &Path, report: &SearchResult) -> Result<()> {
     }
     entries.push(serde_json::to_value(report)?);
     let data = serde_json::to_vec_pretty(&entries)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create result dir {}", parent.display()))?;
+    }
     fs::write(path, data)
         .with_context(|| format!("Failed to write result file {}", path.display()))?;
     Ok(())

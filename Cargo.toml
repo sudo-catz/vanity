@@ -13,3 +13,6 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tiny-keccak = { version = "2.0", features = ["keccak"] }
 ethabi = { version = "18.0", default-features = false, features = ["full-serde", "std"] }
+k256 = { version = "0.13", features = ["ecdsa"] }
+bip39 = "1.1"
+bip32 = { version = "0.5", features = ["secp256k1"] }

@@ -1,119 +1,149 @@
-# EVM Smart Contract Vanity Address Generator
+# EVM Vanity Toolkit
 
-This Rust helper brute-forces CREATE2 salts so you can land contracts (via `Create2Factory` or the universal CREATE2 deployer) at vanity addresses. It consumes Hardhat artifacts (or any JSON artifact with `bytecode`) and can also take a raw bytecode hex blob, so you can point it at any compiled contract without rewriting init code by hand.
+Two binaries live in this workspace:
 
-## Features
+- **`create2-vanity`** – brute-forces CREATE2 salts so contracts deployed via `Create2Factory` (or the universal CREATE2 deployer) can land at vanity addresses. It reads Hardhat artifacts, ABI-encodes constructor args for you, and mirrors the exact hashing that a chain performs before CREATE2 deployments.
+- **`vanity_eoa`** – brute-forces externally-owned account (EOA) private keys whose addresses match a desired prefix/suffix. It reuses the same deterministic scheduling, checkpoint/resume flow, and exposes progress stats that dashboards can scrape.
 
-- Reads the factory address + artifact bytecode, then hashes like a real CREATE2 deploy would.
-- Brute-forces salts with multi-threaded Rayon workers (defaults to all CPU cores).
-- Optional checksum matching for case-sensitive vanity constraints.
-- Single-shot mode (`--salt`) to predict the resulting address without brute force.
+Both binaries are CPU-bound Rust executables built on Rayon for multi-threading and TinyKeccak for hashing.
 
-## Building
+## Installation
 
 ```bash
 cargo build --release
 ```
 
-The binary lives at `target/release/create2-vanity`. During development you can use `cargo run --release -- …`.
+`target/release/create2-vanity` is the default binary. Use `cargo run --release -- …` for CREATE2 searches or add `--bin vanity_eoa` to run the EOA searcher during development.
 
-## Usage
+## Quick start
+
+### CREATE2 vanity search
 
 ```bash
 cargo run --release -- \
   --factory 0xYourFactory \
   --artifact artifacts/contracts/SimpleStorage.sol/SimpleStorage.json \
-  --prefix cafe \
-  --suffix f00d \
-  --checksum-match
+  --prefix cafe --suffix f00d \
+  --checksum-match \
+  --checkpoint salts-checkpoint.json
 ```
 
-Key flags (mirrors `--help`):
+### EOA vanity keys
+
+```bash
+cargo run --release --bin vanity_eoa -- \
+  --prefix cafe --suffix f00d \
+  --checksum-match \
+  --checkpoint vanity-checkpoint.json \
+  --stats-interval 10 --stats-json
+```
+
+## Repository layout
+
+- `contracts/` – Solidity sources such as `Create2Factory.sol` and `SimpleStorage.sol`.
+- `scripts/` – Helper utilities (currently the CREATE2 calldata builder for the universal deployer).
+- `src/` – The main Rust crate that brute-forces CREATE2 salts and EOA keys.
+- `results/` – Default home for result/checkpoint JSON (ignored by git except for `.gitkeep`).
+
+## CLI reference
+
+### `create2-vanity`
 
 - `--factory <addr>` – deployed `Create2Factory` address (20-byte hex).
-- `--artifact <path>` – Hardhat artifact JSON (default: `artifacts/contracts/SimpleStorage.sol/SimpleStorage.json`).
-- `--bytecode <hex>` – override the artifact and hash this raw init code (useful when you already appended constructor args).
-- `--constructor-args <csv>` – supply comma-separated constructor arguments (parsed using the artifact ABI and encoded automatically).
-- `--salt <hex>` – deterministic mode; prints the resulting address and exits.
-- `--prefix` / `--suffix` – lowercase hex constraints unless checksum mode is enabled.
-- `--checksum-match` – apply prefix/suffix to the EIP-55 checksum form (case-sensitive). Slower but prettier.
-- `--attempts <n>` – optional cap (0 = unlimited).
-- `--threads <n>` – override Rayon worker count.
-- `--seed <u64>` – deterministic RNG seed so you can resume a run or shard work across machines. Defaults to OS randomness.
-- `--checkpoint <path>` – periodically write a JSON checkpoint with the next attempt counter + config hash.
-- `--resume <path>` – restart from a previously saved checkpoint (enforces matching config + seed).
-- `--checkpoint-interval <n>` – attempts between checkpoint flushes (default: 100k).
-- `--output <path>` – override the default `salt.json` result file (multiple hits append).
+- `--artifact <path>` – Hardhat artifact JSON with `bytecode` + ABI (default: `artifacts/contracts/SimpleStorage.sol/SimpleStorage.json`).
+- `--bytecode <hex>` – bypass the artifact and hash this init code directly.
+- `--constructor-args <csv>` – parse/encode constructor args via the artifact ABI before hashing (comma separated). Order must match the constructor signature.
+- `--salt <hex>` – deterministic one-off mode; prints the resulting address/checksum and exits.
+- `--prefix`, `--suffix` – lowercase hex constraints unless checksum mode is enabled.
+- `--checksum-match` – apply prefix/suffix to the EIP-55 checksum (case-sensitive). Prettier, but slower per nibble.
+- `--attempts <n>` – optional attempt cap (0 = unlimited).
+- `--threads <n>` – override Rayon worker count (defaults to CPU cores).
+- `--seed <u64>` – deterministic RNG seed so you can shard across machines or resume later.
+- `--checkpoint <path>` / `--checkpoint-interval <n>` – persist the next attempt counter + config hash to JSON every N attempts.
+- `--resume <path>` – restart exactly where a checkpoint left off (enforces matching config + seed).
+- `--output <path>` – append successful hits to this JSON file (defaults to `results/salt.json`).
 
-If neither `--prefix` nor `--suffix` is provided you must pass `--salt`.
+### `vanity_eoa`
 
-Constructor encoding: the tool reads the artifact ABI and, if you pass `--constructor-args`, ABI-encodes those values (comma-separated) before hashing the init code. Example for a single `address` parameter: `--constructor-args 0x1234...dead`. The arguments must appear in the same order as the constructor inputs.
+- `--prefix`, `--suffix`, `--checksum-match`, `--attempts`, `--threads`, `--seed` – same semantics as `create2-vanity`.
+- `--checkpoint <path>` / `--resume <path>` / `--checkpoint-interval <n>` – identical checkpoint/resume flow (stored as `next_attempt`, `base_seed`, `config_hash`).
+- `--output <file>` – defaults to `results/vanity-eoa.json`. Each entry includes the private key, public key (uncompressed SEC1), address, checksum, attempts, and search parameters.
+- `--mnemonic` – generate BIP-39 mnemonics and derive the vanity address via HD wallets instead of emitting standalone private keys.
+- `--hd-path <path>` – derivation path used when `--mnemonic` is set (default: `m/44'/60'/0'/0/0`).
+- `--derive-attempt <n>` – with `--seed`, recreate the key/mnemonic for a specific attempt index and exit (no brute force run).
+- `--stats-interval <seconds>` – emit periodic progress (attempts checked + attempts/s). Set to 0 to disable.
+- `--stats-json` – emit stats as `STATS {"attempts":…}` JSON instead of human text, perfect for dashboards.
 
-## Performance tips
+## Deterministic search & seeds
 
-- Each constrained nibble multiplies difficulty by 16; checksum mode effectively doubles it per nibble. `bee…cafe` ≈ 1/16⁷, `cafe…babe` ≈ 1/16⁸, etc.
-- Progress logs now emit every 10k attempts from worker 0 to minimize stdout contention. Redirect stdout for very long sessions.
-- Salts are derived deterministically from `(seed, attempt_index)`, so two runs only overlap if they intentionally share both values. Give each machine a unique `--seed` to split work safely.
+Both binaries derive work items from `(seed, attempt_id)`. CREATE2 salts hash the tuple into a 32-byte salt; the EOA searcher hashes it into private key material (discarding invalid keys). This guarantees:
+
+- Reproducibility – using the same seed and attempt range replays the exact salts/keys.
+- Safe sharding – give each machine a unique seed to avoid overlapping attempts.
+- Seamless resume – checkpoints store the next attempt ID, so resuming never re-processes old work.
+
+If you omit `--seed`, the CLI draws a random seed and prints it so you can reuse it later.
 
 ## Checkpoint & resume
 
-- Pass `--checkpoint checkpoint.json` to write the current attempt counter every `--checkpoint-interval` attempts (defaults to 100k). The file stores the base seed, config hash, and the next attempt to try.
-- Use `--resume checkpoint.json` (optionally along with `--checkpoint` to keep updating the same file) to continue exactly where you left off. The CLI verifies the hash of all search parameters plus the seed to prevent mismatched resumes.
-- Because salts depend only on `(seed, attempt)`, resuming does not re-check previously tested salts—execution jumps straight to the stored attempt ID.
+- Pass `--checkpoint path.json` to periodically flush `{version,next_attempt,base_seed,config_hash}`.
+- Use `--resume path.json` (optionally alongside `--checkpoint path.json` to keep updating the same file) to continue from that attempt ID.
+- `config_hash` covers every search parameter + seed, so mismatched resumes are rejected.
+- On exit—whether a hit is found or the attempt limit is reached—the CLIs force one last checkpoint write so the file always reflects the next attempt to try.
+- Need to inspect a past attempt without re-running the search? Pass `--seed <base_seed> --derive-attempt <id>` (optionally with `--mnemonic/--hd-path`) to recreate the exact key/mnemonic for that attempt and print it immediately.
 
 ## Result exports
 
-- Every successful search appends a JSON object to `salt.json` (newline-agnostic array). Use `--output custom.json` to write to a different file/path.
-- Each entry includes the seed, attempts needed, checksum settings, prefix/suffix, artifact path, bytecode source, constructor args, and the computed `salt/address/checksum/initHash`.
-- The JSON array can be scraped by scripts or dashboards so long brute-force jobs don’t require copying from terminal scrollback.
+Both binaries append hits under `results/` (`results/salt.json` or `results/vanity-eoa.json`). Entries capture:
 
-## Example: predict a known salt
+- Inputs: factory, artifact path, constructor args, prefix/suffix, checksum mode, seed.
+- Outputs: salt, contract address, checksum, init-code hash (CREATE2) **or** private key, public key, optional mnemonic + derivation path, address, checksum (EOA).
+- Search metadata: attempts taken, attempt cap, bytecode source, stats mode, etc.
 
-```bash
-cargo run --release -- \
-  --factory 0x3528225F82292570B366eB4da9727c3E1c9DfBdb \
-  --artifact artifacts/contracts/SimpleStorage.sol/SimpleStorage.json \
-  --salt 0xc261bc78b72af4a03d00448cc9230d0a861eef6a85ab9a0ef33e0432b868a524
-```
+Use `--output` to target a different path. Existing files are interpreted as JSON arrays, so you can accumulate multiple hits or merge across runs.
 
-Output shows the deterministic CREATE2 child address plus its checksum so you can verify deployments before broadcasting.
+## Performance tips
 
-## Tweaking ideas
+- Each constrained nibble multiplies difficulty by 16; checksum mode roughly doubles the cost per nibble. `bee…cafe` ≈ 1/16⁷, `cafe…babe` ≈ 1/16⁸, etc.
+- Progress logs now emit every 10k attempts from worker 0 (in addition to optional stats). Redirect stdout for very long sessions.
+- Lowering `--checkpoint-interval` gives more frequent resume points but spends more time writing JSON; tune to match your environment.
 
-- Add a lightweight coordinator/worker protocol so you can dole out seed windows automatically across a fleet.
-- Experiment with SIMD/GPU Keccak implementations once CPU-side overhead is squeezed out.
-- Surface live stats (attempts/s, ETA per nibble, etc.) through a structured logging or metrics endpoint for richer monitoring.
+## Constructor encoding & calldata
 
-PRs welcome if you add distributed search, checkpointing, or alternate front-ends!
+When you pass `--constructor-args`, `create2-vanity` loads the Hardhat artifact ABI, tokenizes each value, ABI-encodes them, then appends the payload to the bytecode before hashing. This guarantees the CREATE2 address derived here matches the address produced when you later deploy.
 
-## Bonus: deploying through the universal CREATE2 factory
-
-Many networks ship the singleton CREATE2 deployer at `0x4e59b44847B379578588920cA78FbF26c0B4956C`. It has no ABI—just send calldata encoded as `salt (32 bytes) || init_code`. You can pipe the artifact + salt that this tool found into `scripts/build-create2-calldata.ts`:
+Need calldata for the universal CREATE2 deployer (`0x4e59…4956C` on many networks)? Use the companion script:
 
 ```bash
 npm exec tsx scripts/build-create2-calldata.ts \
-  --salt 0xYourSaltFoundByVanityTool \
+  --salt 0xSaltFromVanityTool \
   --artifact artifacts/contracts/SimpleStorage.sol/SimpleStorage.json \
   --constructor-args 0xOwnerAddress \
   --out calldata.txt
-```
 
-That writes the calldata blob to `calldata.txt` (and displays it in stdout). Broadcast it with your favorite sender, e.g.:
-
-```bash
 cast send 0x4e59b44847B379578588920cA78FbF26c0B4956C \
   --value 0 \
   --data $(cat calldata.txt) \
   --rpc-url <rpc>
 ```
 
-The singleton will CREATE2-deploy the provided init code using the exact salt you searched for, yielding the deterministic vanity address. Once your own `Create2Factory` is live you can call its ABI directly, but the universal deployer is perfect for bootstrapping the very first factory or any one-off vanity contract.
-
 ### Keep constructor args in sync
 
-- Pass identical arguments to both the vanity search (`create2-vanity --constructor-args …`) and the calldata builder (`scripts/build-create2-calldata.ts --constructor-args …`) so the init-code hash stays consistent.
-- When verifying on explorers (Hardhat example):  
+- Use the exact same arguments for the CREATE2 search (`create2-vanity --constructor-args …`) and the calldata builder so the init-code hash stays consistent.
+- When verifying deployments on explorers (Hardhat example):
   ```bash
   npm exec hardhat verify -- --network <net> <deployed-address> "0xOwnerAddress"
-  ```  
-  Replace the address string with the same constructor value you encoded above (or wrap multiple args in a JSON array).
+  ```
+  Provide the same constructor values you encoded above (wrap multiple args in a JSON array).
+
+## Bonus: deploying through the universal CREATE2 factory
+
+The singleton CREATE2 deployer accepts calldata encoded as `salt (32 bytes) || init_code`. By pairing a salt from `create2-vanity` with calldata produced by `scripts/build-create2-calldata.ts`, you can deterministically land vanity contracts even before your own `Create2Factory` is deployed. Once your factory is live, you can call its ABI directly using the same salt + init code to produce the identical vanity address.
+
+## Tweaking ideas
+
+- Add a coordinator that hands out `(seed, attempt window)` slices across a fleet.
+- Experiment with SIMD/GPU Keccak implementations once CPU-side overhead is minimized.
+- Extend the stats output with attempts-per-second histograms or Prometheus exporters for richer observability.
+
+PRs welcome!

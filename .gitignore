@@ -1,5 +1,6 @@
 # Node modules
 /node_modules
+create2-vanity-cli/
 
 # Compilation output
 /dist
@@ -21,3 +22,6 @@
 
 # Rust build artifacts
 /target
+
+# Generated results/checkpoints
+/results/*.json
